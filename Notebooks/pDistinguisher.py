@@ -1,17 +1,22 @@
+from joblib import Parallel, delayed
 import numpy as np
 import matplotlib.pyplot as plt
 import pandas as pd
 from scipy.optimize import curve_fit
 from scipy.optimize import least_squares
 from scipy.special import erf
+from sklearn.metrics import pairwise_distances
+from sklearn.model_selection import GridSearchCV
+from sklearn.neighbors import KernelDensity, NearestNeighbors
 from sklearn.preprocessing import MinMaxScaler
 
+
 class knn_distinguish():
-    def __init__(self, data, data_origin, predicted_class) -> None:
+    def __init__(self, data: pd.DataFrame, predicted_class:list) -> None:
         '''
-        data->the combined data
-        data_origin->the original data
-        predicted_class->a bunch of class from data
+        data->the combined data, the whole data
+        data_origin->the original data, aka the test data
+        predicted_class->a bunch of class from data, class name, we assume it's a list
         '''
         # print(len(data))
         self.store_LSE = {}
@@ -23,24 +28,36 @@ class knn_distinguish():
         self.ERF_popt = {}
         self.algebra_popt = {}
         self.Gompertz_popt = {}
+        
+        #store for edge case:
+        self.arctan_min = {}
+        self.logistic_min = {}
+        self.tanh_min = {}
+        self.arc_min = {}
+        self.gd_min = {}
+        self.ERF_min = {}
+        self.algebra_min = {}
+        self.Gompertz_min = {}
+        
         self.data = data
-        self.data_origin = data_origin
+        # self.data_origin = data_origin
         self.predicted_class = predicted_class
-        # self.data_location = data_location
-        # self.data_ori_location = data_ori_location
+        self.maxDis_train = 0
+        self.df_comb1 = None
 
-    def combine_data(self, data_list, classes):
-        df_comb = pd.DataFrame()
-        i = 0
-        for df in data_list:
-            df['class'] = classes[i]
-            df_comb = pd.concat([df, df_comb])
-            i += 1
-        df_comb = df_comb.drop_duplicates()
-        return df_comb
+    def combine_data(self, data, classes):
+        '''
+        split the data according to the classes
+        '''
+        df = pd.DataFrame(data)
+        for index, name in enumerate(classes):
+            df.loc[df.iloc[:, 0] == name, 'class'] = name
+        df = df.drop(df.columns[0], axis=1).drop_duplicates()
+        return df
     
     def data_process(self, dataframe, class_name):
-        return dataframe[dataframe['class']==class_name].drop("class",axis=1).to_numpy()
+        a = dataframe[dataframe['class']==class_name].drop("class",axis=1).astype(float).to_numpy()
+        return a
 
     def data_distance(self, data):
         '''
@@ -49,31 +66,29 @@ class knn_distinguish():
         '''
         if len(data) == 1:
             return np.array(data)
-        shortest_distance = [0]*len(data)
-        for i in range(len(data)):
-            x = np.delete(data,i,0)
-            temp = (x-data[i])**2
-            d = np.sqrt(np.sum(temp,axis=1))
-            shortest_distance[i] = d.min()
-        # print(shortest_distance)
-        res = np.array(shortest_distance)
-        if not np.any(res):
+        nbrs = NearestNeighbors(n_neighbors=2, algorithm='ball_tree').fit(data)
+        distances, _ = nbrs.kneighbors(data)
+        shortest_distances = distances[:, 1]
+        if not np.any(shortest_distances):
             return np.array([0] * len(data))
-        return res   # return an array of real data's NN distance
+        return shortest_distances
     
-    def empirical_CDF(self, data, title):
+    def empirical_CDF(self, data):
         '''
         return x,y data of CDF 
         '''   
-        # print(data) 
         sort_data = np.sort(data)
+        self.maxDis_train =np.max(sort_data)
         if sort_data.ndim == 1:
             x = np.concatenate(([0],sort_data))
         else:
             x = np.concatenate(([0], sort_data.reshape(-1)))
         y = np.zeros((x.shape))
-        for i in range(1,len(x)):
-            y[i] = i/len(x)
+        for i in range(len(x)):
+            # if i == 0:
+            #     print((len(x)-i-0.5)/len(x))
+            y[i] = (len(x)-i-0.5)/len(x)
+        print(y)
         return x,y
     
     def auto_curve_fit(self, data_NN, x, y, x_scale_factor, func, s, p_control=None):
@@ -82,7 +97,6 @@ class knn_distinguish():
         x,y: from CDF
         s: sigma in curve_fit(), for weighting
         '''
-        # print(np.median(data_NN))
         if p_control == "Gompertz":
             p0 = [1,1]
         elif p_control == "Weight":
@@ -91,16 +105,18 @@ class knn_distinguish():
             p0 = [np.median(data_NN)/x_scale_factor,1] # this is initial guess for sigmoid parameters
         
         if not np.any(x):
-            popt, _ = curve_fit(f=func, xdata=x, ydata=y, p0=p0,method='lm')
+            try:
+                popt, _ = curve_fit(f=func, xdata=x, ydata=y, p0=p0,method='lm')
+            except TypeError:
+                popt = np.zeros(5)
         else:
-            popt, _ = curve_fit(f=func, xdata=x/x_scale_factor, ydata=y, p0=p0,method='lm')
-
-        # parameters yielded by Curve_fit: x0, k
-        #print("curve_fit parameter on "+str(func)[9:-22]+": ", popt)
+            try:
+                popt, _ = curve_fit(f=func, xdata=x/x_scale_factor, ydata=y, p0=p0,method='lm')
+            except TypeError:
+                popt = np.zeros(5)
         return popt
     
     def data_binning(self, data):
-    
         x = np.sort(data) 
         N = len(x)                   # e.g N = 500, sqrt(500)=22.3
         lower = int(np.floor(np.sqrt(N))) # 22
@@ -133,19 +149,27 @@ class knn_distinguish():
     def binning_xy(self, binned_data):
         x = np.concatenate(([0],binned_data))
         y = np.zeros((x.shape))
-        
-        for i in range(1,len(x)):
-            y[i] = i/len(x)
-            
+        for i in range(len(x)):
+            y[i] = (len(x)-i-0.5)/len(x)
         return x,y
     
     
-    def sigmoids_for_class(self, data, name, factor, func_list, binning=False): #removed color list here
+    def sigmoids_for_class(self, data, name, factor, func_list, binning=False, plot=False): #removed color list here
         if binning:
             x,y = self.binning_xy(self.data_binning(data))
         else:
-            x,y = self.empirical_CDF(data, name)
-        # max_val = np.max(x)
+            x,y = self.empirical_CDF(data)
+        if plot:
+            color_list = ['g','r','c','m','y','k','brown','gray']
+            f,ax = plt.subplots(1,2,figsize=(16,6))
+            ax[0].set_title('1-y(p_value) of '+ str(name))
+            ax[0].set_yscale('log')
+            ax[0].scatter(x,1-y, color='b',s=10)
+
+            ax[1].set_title('y of '+name)
+            ax[1].scatter(x,y, color='b',s=10)
+        res = []
+        #print("for ", name," :")
         for i in range(len(func_list)):
             try:
                 if i == 7:
@@ -157,111 +181,111 @@ class knn_distinguish():
             except RuntimeError:
                 print("error in ",str(func_list[i])[9:-22])
                 continue
-            # print(x)
             smoothing_term = 1e-10
-            y2 = func_list[i](x/factor, *p)
-            y_pred = 1-y2 + smoothing_term
-            y_true = 1-y + smoothing_term
-            y_pred_filtered = y_pred[y_pred > 0]
-            y_true_filtered = y_true[y_pred > 0]
-            error = np.sum(np.square(np.log(y_pred_filtered) - np.log(y_true_filtered)))
+            if np.array_equal(p, np.zeros(5)):
+                y2 = 0
+                y_true = 1-y + smoothing_term
+                y_true_filtered = y_true[y_true > 0]
+                error = np.sum(np.square(np.log(y_true_filtered + smoothing_term)))
+            else:
+                y2 = func_list[i](x/factor, *p)
+                y_pred = y2
+                y_true = y
+                y_pred_filtered = y_pred[y_pred > 0]
+                y_true_filtered = y_true[y_pred > 0]
+                error = np.sum(np.square(np.log(y_pred_filtered + smoothing_term) - np.log(y_true_filtered + smoothing_term)))
+
             if func_list[i] == self.arctan_GD:
                 self.arctan_popt[f"{name}"] = p
-                # print(len(p))
-                # error = np.sum((np.log(y_pred)-np.log(y_true))**2)
-                
-                # error = np.log(np.sum(np.exp((2*((1-y2) - (1-y))))))
-                # error = np.sum((np.log(1-y) - np.log(1-y2))**2)
-                # error = np.sum(((1-y) - np.log(1-y2))**2)
-                # error = np.log(np.sum(np.square((1-y) - np.exp(1-y2)))) 
+                self.arctan_min[f"{name}"] = np.min(y2)
                 self.store_LSE["arctan_gd"] = error
-                # print("arcran_GD: " + str(error))
-                # self.arctan_popt.append(self.arctan_GD)
+                if plot:
+                    ax[0].plot(x, 1-y2, color=color_list[i], label='arctan_GD')
+                    ax[1].plot(x, y2, color=color_list[i], label='arctan_GD')
+                # print(np.min(y2))
+                res.append([func_list[i], *p])
             if func_list[i] == self.logistic:
                 self.logistic_popt[f"{name}"] = p
-                # error = np.sum((np.log(y_pred)-np.log(y_true))**2)
-                # error = np.sum((np.log(1-y) - np.log(1-y2))**2)
-                # error = np.sum(((1-y) - np.log(1-y2))**2)
-                # error = np.log(np.sum(np.square((1-y) - np.exp(1-y2)))) 
+                self.logistic_min[f"{name}"] = np.min(y2)
                 self.store_LSE["logistic"] = error
-                # print("logistic: " + str(error))
-                # print(p)
-                # self.logistic_popt.append(self.logistic)
+                if plot:
+                    ax[0].plot(x, 1-y2, color=color_list[i], label='logistic')
+                    ax[1].plot(x, y2, color=color_list[i], label='logistic')
+                res.append([func_list[i], *p])
             if func_list[i] == self.tanh:
                 self.tanh_popt[f"{name}"] = p
-                # error = np.log(np.sum(np.exp((2*((1-y2) - (1-y))))))
-                # error = np.sum((np.log(1-y) - np.log(1-y2))**2)
-                # error = np.sum((np.log(y_pred)-np.log(y_true))**2)
+                self.tanh_min[f"{name}"] = np.min(y2)
                 self.store_LSE["Hyperbolic tangent"] = error
-                # print("tanh: " + str(error))
-                # self.tanh_popt.append(self.tanh)
+                if plot:
+                    ax[0].plot(x, 1-y2, color=color_list[i], label='Hyperbolic tangent')
+                    ax[1].plot(x, y2, color=color_list[i], label='Hyperbolic tangent')
+                res.append([func_list[i], *p])
             if func_list[i] == self.arctan:
                 self.arc_popt[f"{name}"] = p
-                # error = np.sum((np.log(1-y) - np.log(1-y2))**2)
-                # error = np.log(np.sum(np.exp((2*((1-y2) - (1-y))))))
-                # error = np.sum(((1-y) - np.log(1-y2))**2)
-                # error = np.sum((np.log(y_pred)-np.log(y_true))**2)
+                self.arc_min[f"{name}"] = np.min(y2)
                 self.store_LSE["arctan"] = error
-                # print("arctan: " + str(error))
-                # self.arc_popt.append(self.arctan)
+                if plot:
+                    ax[0].plot(x, 1-y2, color=color_list[i], label='arctan')
+                    ax[1].plot(x, y2, color=color_list[i], label='arctan')
+                res.append([func_list[i], *p])
             if func_list[i] == self.GD:
                 self.gd_popt[f"{name}"] = p
-                # error = np.log(np.sum(np.exp((2*((1-y2) - (1-y))))))
-                # error = np.sum((np.log(1-y) - np.log(1-y2))**2)
-                # error = np.sum(((1-y) - np.log(1-y2))**2)
-                # error = np.sum((np.log(y_pred)-np.log(y_true))**2)
+                self.gd_min[f"{name}"] = np.min(y2)
                 self.store_LSE["Gudermannian"] = error
-                # print("GD: " + str(error))
-                # self.gd_popt.append(self.GD)
+                if plot:
+                    ax[0].plot(x, 1-y2, color=color_list[i], label='Gudermannian')
+                    ax[1].plot(x, y2, color=color_list[i], label='Gudermannian')
+                res.append([func_list[i], *p])
             if func_list[i] == self.ERF:
                 self.ERF_popt[f"{name}"] = p
-                # error = np.log(np.sum(np.exp((2*((1-y2) - (1-y))))))
-                # error = np.sum((np.log(1-y) - np.log(1-y2))**2)
-                # error = np.sum(((1-y) - np.log(1-y2))**2)
-                # error = np.sum((np.log(y_pred)-np.log(y_true))**2)
+                self.ERF_min[f"{name}"] = np.min(y2)
                 self.store_LSE["ERF"] = error
-                # print("ERF: " + str(error))
-                # self.ERF_popt.append(self.ERF)
+                if plot:
+                    ax[0].plot(x, 1-y2, color=color_list[i], label='ERF')
+                    ax[1].plot(x, y2, color=color_list[i], label='ERF')
+                res.append([func_list[i], *p])
             if func_list[i] == self.algebra:
                 self.algebra_popt[f"{name}"] = p
-                # error = np.sum((np.log(1-y) - np.log(1-y2))**2)
-                # error = np.log(np.sum(np.exp((2*((1-y2) - (1-y))))))
-                # error = np.sum(((1-y) - np.log(1-y2))**2)
-                # error = np.sum((np.log(y_pred)-np.log(y_true))**2)
+                self.algebra_min[f"{name}"] = np.min(y2)
                 self.store_LSE["algebraic"] = error
-                # print("algebra: " + str(error))
-                # self.algebra_popt.append(self.algebra)
+                if plot:
+                    ax[0].plot(x, 1-y2, color=color_list[i], label='algebraic')
+                    ax[1].plot(x, y2, color=color_list[i], label='algebraic')
+                res.append([func_list[i], *p])
             if func_list[i] == self.Gompertz:
                 self.Gompertz_popt[f"{name}"] = p
-                # error = np.sum((np.log(1-y) - np.log(1-y2))**2)
-                # error = np.log(np.sum(np.exp((2*((1-y2) - (1-y))))))
-                # error = np.sum(((1-y) - np.log(1-y2))**2)
-                # error = np.sum((np.log(y_pred)-np.log(y_true))**2)
+                self.Gompertz_min[f"{name}"] = np.min(y2)
                 self.store_LSE["Gompertz"] = error
-                # print("Gompertz: "+ str(error))
-                # self.Gompertz_popt.append(self.Gompertz)
-
+                if plot:
+                    ax[0].plot(x, 1-y2, color=color_list[i], label='Gompertz')
+                    ax[1].plot(x, y2, color=color_list[i], label='Gompertz')
+                res.append([func_list[i], *p])
+        if plot:
+            ax[0].legend(loc='lower left')
+            ax[1].legend(loc='lower left')
+            plt.show()
+        return res
 
 
     def logistic(self, x,x0, k):
-        m = (1/ (1 + np.exp(-k*(x-x0))))      
-        return m
+        m = (1/ (1 + np.exp(-k*(x-x0))))     
+        return np.clip(m, 0, 1)
 
     def tanh(self, x, x0, k): 
-        m = (1+np.tanh(k*(x-x0)))/2
-        return m
+        m = (1+np.tanh(k*(x-x0)))/2    
+        return np.clip(m, 0, 1)
 
     def arctan(self, x, x0, k):
         m = (1+(2/np.pi)*np.arctan(k*(x-x0)))/2
-        return m
+        return np.clip(m, 0, 1)
 
     def GD(self, x, x0, k):
         m = (1+(4/np.pi)*np.arctan(np.tanh(k*(x-x0))))/2
-        return m
+        return np.clip(m, 0, 1)
 
     def ERF(self, x, x0, k):
         m = (1+erf(k*(x-x0)))/2
-        return m
+        return np.clip(m, 0, 1)
 
     def algebra(self, x, x0, k):
         abs_x = abs(x)
@@ -270,415 +294,133 @@ class knn_distinguish():
         # m = (1+x/((1+abs(x)**k)**(1/k)))/2
         if np.any(denominator == 0):
             m[denominator == 0] = 0
-        return m
+        return np.clip(m, 0, 1)
 
     def arctan_GD(self, x,x0,k, w):
         m = w*self.GD(x,x0,k)+(1-w)*self.arctan(x,x0,k)
-        return m
+        return np.clip(m, 0, 1)
 
     def Gompertz(self, x,b,c):
         m = np.e**(-np.e**(b-c*x))
-        return m
-    
-    def euclid(self, origin, other):
-        return np.sum((origin - other) ** 2)**(1/2)
+        return np.clip(m, 0, 1)
+        
+    def build_AM(self, x, y):
+        """Function to build the A matrix in parallel.
 
-    def NN_distance(self, ref_point, data):
-        nearest_distance = 1e999
-        for point in data:
-            if self.euclid(ref_point, point) < nearest_distance: 
-                nearest_distance = self.euclid(ref_point, point)
-        return nearest_distance
-    
-    def getPvalue(self, if_binning=False):
+        Keyword arguments:
+        x -- the input data numpy array in the form nxm (samplesxfeatures).
+        y -- the numpy array that represents the classes for each sample.
+        """
+        def build_cm(feat):
+            cm = []
+            for lab in np.unique(y):
+                x_fit = x[np.where(y == lab)[0], feat].reshape(-1, 1)
+                params = {'bandwidth': np.linspace(0.01, 1, 30)}
+                grid = GridSearchCV(KernelDensity(), params, cv=5)
+                grid.fit(x_fit)
+                kde = grid.best_estimator_
+                a = np.exp(kde.score_samples(x_fit))
+                cm.extend(a.tolist())
+            return np.array(cm, dtype=object).flatten()
+
+        bm = Parallel(n_jobs=-1)(delayed(build_cm)(feat) for feat in range(x.shape[1]))
+        bm = np.array(bm).T
+        return bm
+
+
+
+    def distanceValue(self, test_data: pd.DataFrame, sigmoid_function, sigmoid_popt, df_combine, edge_dict):
+
+        nearest_NN = []
+        sigmoid_val = []
+
+        for target in sigmoid_popt:
+            distances = pairwise_distances(test_data.to_numpy(), df_combine[df_combine['class'] == f'{target}'].drop(['class'], axis = 1).to_numpy(), metric='euclidean')
+            nearDis = np.min(distances)
+            nearest_NN.append(nearDis)
+            # if sigmoid_function(nearDis, *sigmoid_popt[f'{target}']) == 0 and edge_dict != {}:
+            #     nearDis = self.maxDis_train
+            #     sigmoid_val.append(edge_dict[f'{target}'])
+            # else:
+            sigmoid_val.append(sigmoid_function(nearDis, *sigmoid_popt[f'{target}']))
+        return [sigmoid_val, nearest_NN]
+
+    def helper_plot_curve(self, final_list, nearest_nn, sigmoid_val):
+        popt_list = [v for v in final_list[1].values()]
+        for i in range(len(popt_list)):
+            plt.title(self.predicted_class[i])
+            x = np.linspace(0, nearest_nn[i]+1, 100)
+            y = final_list[0](x, *popt_list[i])
+            plt.plot(x, y, label="train sigmoid")
+            print("nearDis: ", nearest_nn)
+            print("sigmoid Val: ", sigmoid_val)
+            plt.scatter(nearest_nn[i], sigmoid_val[i], label="test point", c='red')
+            plt.legend()
+            plt.show()
+
+    def fit(self, if_binning=False, plot=False):
         df_comb = self.combine_data(self.data, self.predicted_class)
+        self.df_comb1 = df_comb
+        final_list = []
         df_class = df_comb['class']
-        df_comb = df_comb.drop("class", axis = 1)
-        df_comb = pd.DataFrame(MinMaxScaler().fit_transform(df_comb))
+        mpVal = {}
+        for i, v in enumerate(self.predicted_class):
+            mpVal[v] = i+1
+        X = df_comb.iloc[:, :-1].values
+        y = df_comb.iloc[:, -1].values
+        df_comb = self.build_AM(X, y)
+        df_comb = pd.DataFrame(df_comb)
+        df_comb = pd.DataFrame(df_comb, columns=list(df_comb.columns) + ['class'])
         df_comb['class'] = df_class.reset_index(drop = True)
-        functions = [self.logistic, self.tanh, self.arctan, self.GD, self.ERF, self.algebra, self.arctan_GD, self.Gompertz]
-        for i in range(len(self.predicted_class[:-1])):
-            processed_data = self.data_distance(self.data_process(df_comb, self.predicted_class[:-1][i]))
-            self.sigmoids_for_class(processed_data, self.predicted_class[:-1][i], np.mean(processed_data), functions, binning=if_binning)
+        functions = [ self.logistic, self.tanh, self.arctan, self.GD, self.ERF, self.algebra, self.arctan_GD, self.Gompertz]
+        for i in range(len(self.predicted_class)):
+            processed_data = self.data_distance(self.data_process(df_comb, self.predicted_class[i]))
+            # print(np.max(processed_data))
+            #[func, *p]
+            final_dict = self.sigmoids_for_class(processed_data, self.predicted_class[i], np.mean(processed_data), functions, binning=if_binning, plot=plot)
+            # print(final_dict)
+            final_list.append(final_dict)
+            # print(final_dict)
         # print(self.store_MSE)
         sorted_sigmoid = sorted(self.store_LSE.items(), key=lambda x:x[1])
-        print(sorted_sigmoid)
+        #print(sorted_sigmoid)
         sig_function = sorted_sigmoid[0][0]
-        # print(sig_function)
-
-        arctan_GD_val = []
-        ERF_val = []
-        arctan_val = []
-        logistic_val = []
-        tanh_val = []
-        GD_val = []
-        algebra_val = []
-        Gompertz_val = []
-        original = df_comb[df_comb['class'] == 'Original']
-       
         if sig_function == "arctan_gd":
-            for target in self.arctan_popt:
-                nearDis = self.NN_distance(original.drop(['class'], axis = 1).to_numpy(), df_comb[df_comb['class'] == f'{target}'].drop(['class'], axis = 1).to_numpy())
-                arctan_GD_val.append(1-self.arctan_GD(nearDis, *self.arctan_popt[f'{target}']))
-            print("using arctan_GD")
-            return arctan_GD_val
-        # print(arctan_GD_val)
-
-        if sig_function == "ERF": 
-            for target in self.ERF_popt:
-                nearDis = self.NN_distance(original.drop(['class'], axis = 1).to_numpy(), df_comb[df_comb['class'] == f'{target}'].drop(['class'], axis = 1).to_numpy())
-                ERF_val.append(1-self.ERF(nearDis, *self.ERF_popt[f'{target}']))
-            print("using ERF")
-            return ERF_val
-            # print(ERF_val)
-        
+            return self.arctan_GD, self.arctan_popt, self.arctan_min
+        if sig_function == "ERF":
+            return self.ERF, self.ERF_popt, self.ERF_min
         if sig_function == "arctan":
-            for target in self.arc_popt:
-                nearDis = self.NN_distance(original.drop(['class'], axis = 1).to_numpy(), df_comb[df_comb['class'] == f'{target}'].drop(['class'], axis = 1).to_numpy())
-                arctan_val.append(1-self.arctan(nearDis, *self.arc_popt[f'{target}']))
-            print("arctan")
-            return arctan_val
-        
+            return self.arctan, self.arc_popt, self.arc_min
         if sig_function == "logistic":
-            for target in self.logistic_popt:
-                nearDis = self.NN_distance(original.drop(['class'], axis = 1).to_numpy(), df_comb[df_comb['class'] == f'{target}'].drop(['class'], axis = 1).to_numpy())
-                logistic_val.append(1-self.logistic(nearDis, *self.logistic_popt[f'{target}']))
-            print("using logistic")
-            return logistic_val
-
+            return self.logistic, self.logistic_popt, self.logistic_min
         if sig_function == "Hyperbolic tangent":
-            for target in self.tanh_popt:
-                nearDis = self.NN_distance(original.drop(['class'], axis = 1).to_numpy(), df_comb[df_comb['class'] == f'{target}'].drop(['class'], axis = 1).to_numpy())
-                tanh_val.append(1-self.tanh(nearDis, *self.tanh_popt[f'{target}']))
-            print("using tanh")
-            return tanh_val
-
+            return self.tanh, self.tanh_popt, self.logistic_min
         if sig_function == "Gudermannian":
-            for target in self.gd_popt:
-                nearDis = self.NN_distance(original.drop(['class'], axis = 1).to_numpy(), df_comb[df_comb['class'] == f'{target}'].drop(['class'], axis = 1).to_numpy())
-                GD_val.append(1-self.GD(nearDis, *self.gd_popt[f'{target}']))
-            print("using GD")
-            return GD_val
-
+            return self.GD, self.gd_popt, self.gd_min
         if sig_function == "algebraic":
-            for target in self.algebra_popt:
-                nearDis = self.NN_distance(original.drop(['class'], axis = 1).to_numpy(), df_comb[df_comb['class'] == f'{target}'].drop(['class'], axis = 1).to_numpy())
-                algebra_val.append(1-self.algebra(nearDis, *self.algebra_popt[f'{target}']))
-            print("using algebra")
-            return algebra_val
-
-        if sig_function == "Gompertz":        
-            for target in self.Gompertz_popt:
-                nearDis = self.NN_distance(original.drop(['class'], axis = 1).to_numpy(), df_comb[df_comb['class'] == f'{target}'].drop(['class'], axis = 1).to_numpy())
-                Gompertz_val.append(1-self.Gompertz(nearDis, *self.Gompertz_popt[f'{target}']))
-            print("using Gompertz")
-            return Gompertz_val
+            return self.algebra, self.algebra_popt, self.algebra_min
+        if sig_function == "Gompertz":
+            return self.Gompertz, self.Gompertz_popt, self.Gompertz_min
         
+    def predict(self, test_data: pd.DataFrame, sig_function, sig_popt: np.ndarray, edgecase=None):
+        val = []
+        if edgecase != None:
+            edge_dict = edgecase
+        else:
+            edge_dict = {}
         
+        val = self.distanceValue(test_data, sig_function, sig_popt, self.df_comb1, edge_dict)[0]
+        nearest_NN = self.distanceValue(test_data, sig_function, sig_popt, self.df_comb1, edge_dict)[1]
+        print(f"nearest NN" + str(nearest_NN))
+
+        print(f"sigmoid value" + str(val))
+
+        print(str(sig_function))
+        final_list = [sig_function, sig_popt]
+        print(sig_popt)
+        self.helper_plot_curve(final_list, nearest_NN, val)
         
-        
-        
-        
-        
-        
-        
-        
-        
-
-
-if __name__ == "__main__":
-    '''
-    scilearn
-    '''
-    # test my function
-    # classes = ['ER', 'ERDD', 'GEO', 'GEOGD', 'HGG', 'SF', 'SFDD', 'Sticky', 'Original']
-    # classes_pred = ['ER', 'ERDD', 'GEO', 'GEOGD', 'HGG', 'SF', 'SFDD', 'Sticky']
-    # #data_locations = [r"/content/drive/MyDrive/random stuff/Adaptable-Sigmoids/data/AT"+c for c in classes]
-    # data_locations = [r"/Users/lizongli/Desktop/knnResearch/Adaptable-Sigmoids/data/AT"+c for c in classes]
-    # #data_locations_CE = [r"/content/drive/MyDrive/random stuff/Adaptable-Sigmoids/data/CE"+c for c in classes]
-    # data_locations_CE = [r"/Users/lizongli/Desktop/knnResearch/Adaptable-Sigmoids/data/CE"+c for c in classes]
-    # #prediction_p_value = "/content/drive/MyDrive/random stuff/Adaptable-Sigmoids/data/ATOriginal"
-    # prediction_p_value = "Users/lizongli/Desktop/knn research/Adaptable-Sigmoids/data/ATOriginal"
-
-    # print("test AT")
-    # df = pd.read_csv("/Users/lizongli/Desktop/knn research/Adaptable-Sigmoids/data/ATER", header = None, sep = ' ')
-    # df_origin = pd.read_csv("/Users/lizongli/Desktop/knn research/Adaptable-Sigmoids/data/ATOriginal", header = None, sep = ' ')
-    # test_ER = knn_distinguish(df, df_origin, "ER")
-    # print(test_ER.getPvalue())
-    # # print(test_ER.getPvalue(if_binning=True))
-
-    # print("----------------------")
-
-    # df1 = pd.read_csv("/Users/lizongli/Desktop/knn research/Adaptable-Sigmoids/data/ATERDD", header = None, sep = ' ')
-    # test_ERDD = knn_distinguish(df1, df_origin, "ERDD")
-    # print(test_ERDD.getPvalue())
-    # # print(test_ERDD.getPvalue(if_binning=True))
-
-    # print("----------------------")
-
-    # df2 = pd.read_csv("/Users/lizongli/Desktop/knn research/Adaptable-Sigmoids/data/ATGEO", header = None, sep = ' ')
-    # test_GEO = knn_distinguish(df2, df_origin, "GEO")
-    # print(test_GEO.getPvalue())
-    # # print(test_GEO.getPvalue(if_binning=True))
-
-    # print("----------------------")
-    # print("test CE")
-    # df3 = pd.read_csv("/Users/lizongli/Desktop/knn research/Adaptable-Sigmoids/data/CEER", header=None, sep=' ')
-    # df3_origin = pd.read_csv("/Users/lizongli/Desktop/knn research/Adaptable-Sigmoids/data/CEOriginal", header=None, sep=' ')
-    # test_3ER = knn_distinguish(df3, df3_origin, "ER")
-    # print(test_3ER.getPvalue())
-   
-    # print("----------------------")
-    # print("test DM")
-    # df4 = pd.read_csv("/Users/lizongli/Desktop/knn research/Adaptable-Sigmoids/data/DMERDD", header=None, sep=' ')
-    # df4_origin = pd.read_csv("/Users/lizongli/Desktop/knn research/Adaptable-Sigmoids/data/DMOriginal", header=None, sep=' ')
-    # test_4ERDD = knn_distinguish(df4, df4_origin, "ERDD")
-    # print(test_4ERDD.getPvalue())
-
-    # print("----------------------")
-    # print("test EC")
-    # df5 = pd.read_csv("/Users/lizongli/Desktop/knn research/Adaptable-Sigmoids/data/ECHGG", header=None, sep=' ')
-    # df5_origin = pd.read_csv("/Users/lizongli/Desktop/knn research/Adaptable-Sigmoids/data/ECOriginal", header=None, sep=' ')
-    # test_5HGG = knn_distinguish(df5, df5_origin, "HGG")
-    # print(test_5HGG.getPvalue())
-
-    # print("----------------------")
-    # print("test HS")
-    # df6 = pd.read_csv("/Users/lizongli/Desktop/knn research/Adaptable-Sigmoids/data/HSSticky", header=None, sep=' ')
-    # df6_origin = pd.read_csv("/Users/lizongli/Desktop/knn research/Adaptable-Sigmoids/data/HSOriginal", header=None, sep=' ')
-    # test_6sticky = knn_distinguish(df6, df6_origin, "Sticky")
-    # print(test_6sticky.getPvalue())
-
-    # print("----------------------")
-    # print("test MM")
-    # df7 = pd.read_csv("/Users/lizongli/Desktop/knn research/Adaptable-Sigmoids/data/MMGEO", header=None, sep=' ')
-    # df7_origin = pd.read_csv("/Users/lizongli/Desktop/knn research/Adaptable-Sigmoids/data/MMOriginal", header=None, sep=' ')
-    # test_7sticky = knn_distinguish(df7, df7_origin, "GEO")
-    # print(test_7sticky.getPvalue())
-
-    # print("----------------------")
-    # print("test RN")
-    # df8 = pd.read_csv("/Users/lizongli/Desktop/knn research/Adaptable-Sigmoids/data/RNSF", header=None, sep=' ')
-    # df8_origin = pd.read_csv("/Users/lizongli/Desktop/knn research/Adaptable-Sigmoids/data/RNOriginal", header=None, sep=' ')
-    # test_8sticky = knn_distinguish(df8, df8_origin, "SF")
-    # print(test_8sticky.getPvalue())
-
-    # print("-----------------")
-    # classes = ['ER', 'ERDD', 'GEO', 'GEOGD', 'HGG', 'SF', 'SFDD', 'Sticky']
-    # data_locations = [r"/Users/lizongli/Desktop/knnResearch/Adaptable-Sigmoids/data/AT"+c for c in classes]
-    # df_origin = pd.read_csv("/Users/lizongli/Desktop/knnResearch/Adaptable-Sigmoids/data/ATOriginal", header=None, sep=' ')
-    # for i, v in enumerate(data_locations):
-    #     pd_i = pd.read_csv(v, header=None, sep=' ')
-    #     print("testing AT" + classes[i])
-    #     test_allAT = knn_distinguish(pd_i, df_origin, classes[i])
-    #     # print("1")
-    #     print(test_allAT.getPvalue())
-
-
-
-    # print("-----------------")
-    # classes = ['ER', 'ERDD', 'GEO', 'GEOGD', 'HGG', 'SF', 'SFDD', 'Sticky']
-    # data_locations = [r"/Users/lizongli/Desktop/knnResearch/Adaptable-Sigmoids/data/CE"+c for c in classes]
-    # df_origin = pd.read_csv("/Users/lizongli/Desktop/knnResearch/Adaptable-Sigmoids/data/CEOriginal", header=None, sep=' ')
-    # for i, v in enumerate(data_locations):
-    #     pd_i = pd.read_csv(v, header=None, sep=' ')
-    #     print("testing CE" + classes[i])
-    #     test_allCE = knn_distinguish(pd_i, df_origin, classes[i])
-    #     # print("1")
-    #     print(test_allCE.getPvalue())
-
-
-    # print("-----------------")
-    # classes = ['ER', 'ERDD', 'GEO', 'GEOGD', 'HGG', 'SF', 'SFDD', 'Sticky']
-    # data_locations = [r"/Users/lizongli/Desktop/knnResearch/Adaptable-Sigmoids/data/DM"+c for c in classes]
-    # df_origin = pd.read_csv("/Users/lizongli/Desktop/knnResearch/Adaptable-Sigmoids/data/DMOriginal", header=None, sep=' ')
-    # for i, v in enumerate(data_locations):
-    #     pd_i = pd.read_csv(v, header=None, sep=' ')
-    #     print("testing DM" + classes[i])
-    #     test_allDM = knn_distinguish(pd_i, df_origin, classes[i])
-    #     # print("1")
-    #     print(test_allDM.getPvalue())
-
-    # print("-----------------")
-    # classes = ['ER', 'ERDD', 'GEO', 'GEOGD', 'HGG', 'SF', 'SFDD', 'Sticky']
-    # data_locations = [r"/Users/lizongli/Desktop/knnResearch/Adaptable-Sigmoids/data/EC"+c for c in classes]
-    # df_origin = pd.read_csv("/Users/lizongli/Desktop/knnResearch/Adaptable-Sigmoids/data/ECOriginal", header=None, sep=' ')
-    # for i, v in enumerate(data_locations):
-    #     pd_i = pd.read_csv(v, header=None, sep=' ')
-    #     print("testing EC" + classes[i])
-    #     test_allEC = knn_distinguish(pd_i, df_origin, classes[i])
-    #     # print("1")
-    #     # if i == 4:
-    #     print(test_allEC.getPvalue())
-
-
-    # print("-----------------")
-    # classes = ['ER', 'ERDD', 'GEO', 'GEOGD', 'HGG', 'SF', 'SFDD', 'Sticky']
-    # data_locations = [r"/Users/lizongli/Desktop/knnResearch/Adaptable-Sigmoids/data/HS"+c for c in classes]
-    # df_origin = pd.read_csv("/Users/lizongli/Desktop/knnResearch/Adaptable-Sigmoids/data/HSOriginal", header=None, sep=' ')
-    # for i, v in enumerate(data_locations):
-    #     pd_i = pd.read_csv(v, header=None, sep=' ')
-    #     print("testing HS" + classes[i])
-    #     test_allHS = knn_distinguish(pd_i, df_origin, classes[i])
-    #     # print("1")
-    #     print(test_allHS.getPvalue())
-
+        return val
     
-    # print("-----------------")
-    # classes = ['ER', 'ERDD', 'GEO', 'GEOGD', 'HGG', 'SF', 'SFDD', 'Sticky']
-    # data_locations = [r"/Users/lizongli/Desktop/knnResearch/Adaptable-Sigmoids/data/MM"+c for c in classes]
-    # df_origin = pd.read_csv("/Users/lizongli/Desktop/knnResearch/Adaptable-Sigmoids/data/MMOriginal", header=None, sep=' ')
-    # for i, v in enumerate(data_locations):
-    #     pd_i = pd.read_csv(v, header=None, sep=' ')
-    #     print("testing MM" + classes[i])
-    #     test_allMM = knn_distinguish(pd_i, df_origin, classes[i])
-    #     # print("1")
-    #     print(test_allMM.getPvalue())
-
-
-    # print("-----------------")
-    # classes = ['ER', 'ERDD', 'GEO', 'GEOGD', 'HGG', 'SF', 'SFDD', 'Sticky']
-    # data_locations = [r"/Users/lizongli/Desktop/knnResearch/Adaptable-Sigmoids/data/RN"+c for c in classes]
-    # df_origin = pd.read_csv("/Users/lizongli/Desktop/knnResearch/Adaptable-Sigmoids/data/RNOriginal", header=None, sep=' ')
-    # for i, v in enumerate(data_locations):
-    #     pd_i = pd.read_csv(v, header=None, sep=' ')
-    #     print("testing RN" + classes[i])
-    #     test_allRN = knn_distinguish(pd_i, df_origin, classes[i])
-    #     # print("1")
-    #     print(test_allRN.getPvalue())
-
-    
-    # print("-----------------")
-    # classes = ['ER', 'ERDD', 'GEO', 'GEOGD', 'HGG', 'SF', 'SFDD', 'Sticky']
-    # data_locations = [r"/Users/lizongli/Desktop/knnResearch/Adaptable-Sigmoids/data/SC"+c for c in classes]
-    # df_origin = pd.read_csv("/Users/lizongli/Desktop/knnResearch/Adaptable-Sigmoids/data/SCOriginal", header=None, sep=' ')
-    # for i, v in enumerate(data_locations):
-    #     pd_i = pd.read_csv(v, header=None, sep=' ')
-    #     print("testing SC" + classes[i])
-    #     test_allSC = knn_distinguish(pd_i, df_origin, classes[i])
-    #     # print("1")
-    #     print(test_allSC.getPvalue())
-
-    
-    # print("-----------------")
-    # classes = ['ER', 'ERDD', 'GEO', 'GEOGD', 'HGG', 'SF', 'SFDD', 'Sticky']
-    # data_locations = [r"/Users/lizongli/Desktop/knnResearch/Adaptable-Sigmoids/data/SP"+c for c in classes]
-    # df_origin = pd.read_csv("/Users/lizongli/Desktop/knnResearch/Adaptable-Sigmoids/data/SPOriginal", header=None, sep=' ')
-    # for i, v in enumerate(data_locations):
-    #     pd_i = pd.read_csv(v, header=None, sep=' ')
-    #     print("testing SP" + classes[i])
-    #     test_allSP = knn_distinguish(pd_i, df_origin, classes[i])
-    #     # print("1")
-    #     print(test_allSP.getPvalue())
-
-    '''
-    new tests start here
-    '''
-
-    print("--------AT---------")
-    data_lst = []
-    classes = ['ER', 'ERDD', 'GEO', 'GEOGD', 'HGG', 'SF', 'SFDD', 'Sticky', 'Original']
-    classes_pred = ['ER', 'ERDD', 'GEO', 'GEOGD', 'HGG', 'SF', 'SFDD', 'Sticky']
-    data_locations = [r"/Users/lizongli/Desktop/knnResearch/Adaptable-Sigmoids/data/AT"+c for c in classes]
-    for i in data_locations:
-        data_lst.append(pd.read_csv(i, header=None, sep=' '))
-    df_origin = pd.read_csv("/Users/lizongli/Desktop/knnResearch/Adaptable-Sigmoids/data/ATOriginal", header=None, sep=' ')
-    test_AT = knn_distinguish(data_lst, df_origin, classes)
-    print(test_AT.getPvalue(if_binning=True))
-    # print(test_AT.getPvalue(sig_function="algebraic"))
-
-    print("--------DM---------")
-    data_lst = []
-    classes = ['ER', 'ERDD', 'GEO', 'GEOGD', 'HGG', 'SF', 'SFDD', 'Sticky', 'Original']
-    classes_pred = ['ER', 'ERDD', 'GEO', 'GEOGD', 'HGG', 'SF', 'SFDD', 'Sticky']
-    data_locations = [r"/Users/lizongli/Desktop/knnResearch/Adaptable-Sigmoids/data/DM"+c for c in classes]
-    for i in data_locations:
-        data_lst.append(pd.read_csv(i, header=None, sep=' '))
-    df_origin = pd.read_csv("/Users/lizongli/Desktop/knnResearch/Adaptable-Sigmoids/data/DMOriginal", header=None, sep=' ')
-    test_DM = knn_distinguish(data_lst, df_origin, classes)
-    print(test_DM.getPvalue())
-    # print(test_DM.getPvalue(sig_function="algebraic"))
-
-    print("--------CE---------")
-    data_lst = []
-    classes = ['ER', 'ERDD', 'GEO', 'GEOGD', 'HGG', 'SF', 'SFDD', 'Sticky', 'Original']
-    classes_pred = ['ER', 'ERDD', 'GEO', 'GEOGD', 'HGG', 'SF', 'SFDD', 'Sticky']
-    data_locations = [r"/Users/lizongli/Desktop/knnResearch/Adaptable-Sigmoids/data/CE"+c for c in classes]
-    for i in data_locations:
-        data_lst.append(pd.read_csv(i, header=None, sep=' '))
-    df_origin = pd.read_csv("/Users/lizongli/Desktop/knnResearch/Adaptable-Sigmoids/data/CEOriginal", header=None, sep=' ')
-    test_CE = knn_distinguish(data_lst, df_origin, classes)
-    print(test_CE.getPvalue())
-
-    print("-------EC----------")
-    data_lst = []
-    classes = ['ER', 'ERDD', 'GEO', 'GEOGD', 'HGG', 'SF', 'SFDD', 'Sticky', 'Original']
-    classes_pred = ['ER', 'ERDD', 'GEO', 'GEOGD', 'HGG', 'SF', 'SFDD', 'Sticky']
-    data_locations = [r"/Users/lizongli/Desktop/knnResearch/Adaptable-Sigmoids/data/EC"+c for c in classes]
-    for i in data_locations:
-        data_lst.append(pd.read_csv(i, header=None, sep=' '))
-    df_origin = pd.read_csv("/Users/lizongli/Desktop/knnResearch/Adaptable-Sigmoids/data/ECOriginal", header=None, sep=' ')
-    test_EC = knn_distinguish(data_lst, df_origin, classes)
-    print(test_EC.getPvalue())
-
-    print("--------HS---------")
-    data_lst = []
-    classes = ['ER', 'ERDD', 'GEO', 'GEOGD', 'HGG', 'SF', 'SFDD', 'Sticky', 'Original']
-    classes_pred = ['ER', 'ERDD', 'GEO', 'GEOGD', 'HGG', 'SF', 'SFDD', 'Sticky']
-    data_locations = [r"/Users/lizongli/Desktop/knnResearch/Adaptable-Sigmoids/data/HS"+c for c in classes]
-    for i in data_locations:
-        data_lst.append(pd.read_csv(i, header=None, sep=' '))
-    df_origin = pd.read_csv("/Users/lizongli/Desktop/knnResearch/Adaptable-Sigmoids/data/HSOriginal", header=None, sep=' ')
-    test_HS = knn_distinguish(data_lst, df_origin, classes)
-    print(test_HS.getPvalue())
-
-    print("--------MM---------")
-    data_lst = []
-    classes = ['ER', 'ERDD', 'GEO', 'GEOGD', 'HGG', 'SF', 'SFDD', 'Sticky', 'Original']
-    classes_pred = ['ER', 'ERDD', 'GEO', 'GEOGD', 'HGG', 'SF', 'SFDD', 'Sticky']
-    data_locations = [r"/Users/lizongli/Desktop/knnResearch/Adaptable-Sigmoids/data/MM"+c for c in classes]
-    for i in data_locations:
-        data_lst.append(pd.read_csv(i, header=None, sep=' '))
-    df_origin = pd.read_csv("/Users/lizongli/Desktop/knnResearch/Adaptable-Sigmoids/data/MMOriginal", header=None, sep=' ')
-    test_MM = knn_distinguish(data_lst, df_origin, classes)
-    print(test_MM.getPvalue())
-
-    print("--------RN---------")
-    data_lst = []
-    classes = ['ER', 'ERDD', 'GEO', 'GEOGD', 'HGG', 'SF', 'SFDD', 'Sticky', 'Original']
-    classes_pred = ['ER', 'ERDD', 'GEO', 'GEOGD', 'HGG', 'SF', 'SFDD', 'Sticky']
-    data_locations = [r"/Users/lizongli/Desktop/knnResearch/Adaptable-Sigmoids/data/RN"+c for c in classes]
-    for i in data_locations:
-        data_lst.append(pd.read_csv(i, header=None, sep=' '))
-    df_origin = pd.read_csv("/Users/lizongli/Desktop/knnResearch/Adaptable-Sigmoids/data/RNOriginal", header=None, sep=' ')
-    test_RN = knn_distinguish(data_lst, df_origin, classes)
-    print(test_RN.getPvalue())
-
-    print("--------SC---------")
-    data_lst = []
-    classes = ['ER', 'ERDD', 'GEO', 'GEOGD', 'HGG', 'SF', 'SFDD', 'Sticky', 'Original']
-    classes_pred = ['ER', 'ERDD', 'GEO', 'GEOGD', 'HGG', 'SF', 'SFDD', 'Sticky']
-    data_locations = [r"/Users/lizongli/Desktop/knnResearch/Adaptable-Sigmoids/data/SC"+c for c in classes]
-    for i in data_locations:
-        data_lst.append(pd.read_csv(i, header=None, sep=' '))
-    df_origin = pd.read_csv("/Users/lizongli/Desktop/knnResearch/Adaptable-Sigmoids/data/SCOriginal", header=None, sep=' ')
-    test_SC = knn_distinguish(data_lst, df_origin, classes)
-    print(test_SC.getPvalue())
-
-    print("--------SP---------")
-    data_lst = []
-    classes = ['ER', 'ERDD', 'GEO', 'GEOGD', 'HGG', 'SF', 'SFDD', 'Sticky', 'Original']
-    classes_pred = ['ER', 'ERDD', 'GEO', 'GEOGD', 'HGG', 'SF', 'SFDD', 'Sticky']
-    data_locations = [r"/Users/lizongli/Desktop/knnResearch/Adaptable-Sigmoids/data/SP"+c for c in classes]
-    for i in data_locations:
-        data_lst.append(pd.read_csv(i, header=None, sep=' '))
-    df_origin = pd.read_csv("/Users/lizongli/Desktop/knnResearch/Adaptable-Sigmoids/data/SPOriginal", header=None, sep=' ')
-    test_SP = knn_distinguish(data_lst, df_origin, classes)
-    print(test_SP.getPvalue())
-    
-
-
-
-
-
-
+    def accurcy_score(self):
+        return
